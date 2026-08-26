@@ -1,0 +1,3 @@
+[workspace]
+members = ["src/ciphersettle_backend", "src/ciphersettle_core"]
+resolver = "2"

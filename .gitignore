@@ -1,0 +1,16 @@
+# Rust
+/target/
+
+# dfx local replica state
+.dfx/
+
+# secrets / identities — never commit
+*.pem
+*.p12
+.env
+
+# editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

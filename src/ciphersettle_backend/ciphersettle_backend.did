@@ -1,0 +1,22 @@
+type AuditEvent = record {
+  id : nat64;
+  invoice_id : text;
+  actor : principal;
+  action : text;
+  timestamp : nat64;
+};
+
+service : {
+  "register_regulator" : (principal) -> (variant { Ok; Err : text });
+  "revoke_regulator" : (principal) -> (variant { Ok; Err : text });
+  "register_invoice" : (text, text, blob) -> (variant { Ok; Err : text });
+  "grant_settlement_access" : (text, principal) -> (variant { Ok; Err : text });
+  "revoke_settlement_access" : (text) -> (variant { Ok; Err : text });
+  "mark_settled" : (text) -> (variant { Ok; Err : text });
+  "raise_dispute" : (text) -> (variant { Ok; Err : text });
+  "prune_ciphertext" : (text) -> (variant { Ok; Err : text });
+  "get_encrypted_invoice" : (text) -> (variant { Ok : blob; Err : text }) query;
+  "get_vetkd_public_key" : () -> (blob);
+  "derive_invoice_key" : (text, blob) -> (variant { Ok : blob; Err : text });
+  "get_audit_log" : (opt text) -> (vec AuditEvent) query;
+}
