@@ -1,0 +1,40 @@
+type AuditEvent = record {
+  id : nat64;
+  invoice_id : text;
+  actor : principal;
+  action : text;
+  timestamp : nat64;
+};
+
+service : {
+  "register_regulator" : (principal) -> (variant { Ok; Err : text });
+  "revoke_regulator" : (principal) -> (variant { Ok; Err : text });
+  "transfer_admin" : (principal) -> (variant { Ok; Err : text });
+
+  // The canister derives the nullifier itself from these declared fields --
+  // see ciphersettle_core::nullifier for why a caller-supplied nullifier is
+  // not accepted. Returns the derived nullifier as a hex-encoded receipt.
+  "register_invoice" : (
+    text,   // invoice_id
+    text,   // issuer_identifier
+    text,   // invoice_number
+    text,   // currency_code
+    nat64,  // amount_minor_units
+    nat64,  // due_date_unix
+    blob    // ciphertext
+  ) -> (variant { Ok : text; Err : text });
+
+  "grant_settlement_access" : (text, principal) -> (variant { Ok; Err : text });
+  "revoke_settlement_access" : (text) -> (variant { Ok; Err : text });
+  "mark_settled" : (text) -> (variant { Ok; Err : text });
+  "prune_ciphertext" : (text) -> (variant { Ok; Err : text });
+
+  // Update calls, not queries -- see the doc comments in lib.rs on both of
+  // these for why an uncertified query is the wrong tool for
+  // access-controlled or evidentiary reads on ICP.
+  "get_encrypted_invoice" : (text) -> (variant { Ok : blob; Err : text });
+  "get_audit_log" : (opt text) -> (variant { Ok : vec AuditEvent; Err : text });
+
+  "get_vetkd_public_key" : () -> (blob);
+  "derive_invoice_key" : (text, blob) -> (variant { Ok : blob; Err : text });
+}

@@ -1,0 +1,29 @@
+[package]
+name = "ciphersettle_backend"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ciphersettle_core = { path = "../ciphersettle_core" }
+ic-cdk = "0.17"
+serde = { version = "1", features = ["derive"] }
+ic-stable-structures = "0.6"
+
+# --- Sandbox-only pins, NOT a real production dependency policy ---
+# The sandbox this was checked in only has Ubuntu-packaged rustc 1.75
+# available (no network path to rustup). Several transitive deps
+# (ar_archive_writer via cc, plus stacker/psm/ic_principal) started
+# requiring Cargo's `edition2024` feature, which needs cargo 1.85+ --
+# unrelated to and upstream of the real blocker below. Pinning them to
+# slightly older versions gets *past* that noise and down to the actual
+# wall: ic-cdk 0.17.x itself requires rustc 1.78+. On a machine with a
+# current rustup toolchain, delete this whole block and let normal
+# dependency resolution pick current versions.
+candid = "=0.10.10"
+cc = "=1.0.90"
+stacker = "=0.1.15"
+psm = "=0.1.21"
+ic_principal = "=0.1.1"

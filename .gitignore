@@ -1,0 +1,11 @@
+# Rust build artifacts
+/target
+
+# Local ICP replica state and generated artifacts
+/.dfx
+canister_ids.json
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
