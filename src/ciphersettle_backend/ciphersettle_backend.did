@@ -9,14 +9,40 @@ type AuditEvent = record {
 service : {
   "register_regulator" : (principal) -> (variant { Ok; Err : text });
   "revoke_regulator" : (principal) -> (variant { Ok; Err : text });
-  "register_invoice" : (text, text, blob) -> (variant { Ok; Err : text });
+  "transfer_admin" : (principal) -> (variant { Ok; Err : text });
+
+  // The canister derives the nullifier itself from these declared fields --
+  // see ciphersettle_core::nullifier for why a caller-supplied nullifier is
+  // not accepted. Returns the derived nullifier as a hex-encoded receipt.
+  // Rate-limited per caller. Rejections past field validation (duplicate
+  // nullifier vs. duplicate invoice_id) are deliberately indistinguishable
+  // in the returned Err -- see the doc comment on register_invoice in
+  // lib.rs (round 3 review, §1) for why.
+  "register_invoice" : (
+    text,   // invoice_id
+    text,   // issuer_identifier
+    text,   // invoice_number
+    text,   // currency_code
+    nat64,  // amount_minor_units
+    nat64,  // due_date_unix
+    blob    // ciphertext
+  ) -> (variant { Ok : text; Err : text });
+
   "grant_settlement_access" : (text, principal) -> (variant { Ok; Err : text });
   "revoke_settlement_access" : (text) -> (variant { Ok; Err : text });
   "mark_settled" : (text) -> (variant { Ok; Err : text });
-  "raise_dispute" : (text) -> (variant { Ok; Err : text });
   "prune_ciphertext" : (text) -> (variant { Ok; Err : text });
-  "get_encrypted_invoice" : (text) -> (variant { Ok : blob; Err : text }) query;
+
+  // Update calls, not queries -- see the doc comments in lib.rs on both of
+  // these for why an uncertified query is the wrong tool for
+  // access-controlled or evidentiary reads on ICP.
+  "get_encrypted_invoice" : (text) -> (variant { Ok : blob; Err : text });
+
+  // opt nat64 offset, opt nat64 limit -- added round 3 (see lib.rs doc
+  // comment on get_audit_log). limit is always clamped server-side to
+  // AUDIT_LOG_MAX_PAGE regardless of what's requested.
+  "get_audit_log" : (opt text, opt nat64, opt nat64) -> (variant { Ok : vec AuditEvent; Err : text });
+
   "get_vetkd_public_key" : () -> (blob);
   "derive_invoice_key" : (text, blob) -> (variant { Ok : blob; Err : text });
-  "get_audit_log" : (opt text) -> (vec AuditEvent) query;
 }

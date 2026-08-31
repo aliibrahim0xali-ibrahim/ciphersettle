@@ -5,6 +5,11 @@
 //! re-implementing these decisions inline, so the rules are tested once here
 //! and simply wired up there.
 
+pub mod nullifier;
+pub mod sha256;
+
+pub use nullifier::{compute_nullifier, FingerprintError, InvoiceFingerprint, Nullifier};
+
 /// A caller identity. In the real canister this wraps `candid::Principal`;
 /// here it's a plain string so this crate has zero IC dependencies.
 pub type CallerId = String;
@@ -16,6 +21,9 @@ pub enum NullifierError {
 
 /// Double-financing check: a nullifier may be claimed exactly once.
 /// `already_present` is the caller's lookup result against the registry.
+/// The nullifier itself must come from `compute_nullifier` -- see
+/// `nullifier.rs` for why a free-form, caller-chosen nullifier defeats the
+/// entire point of this check.
 pub fn check_nullifier(already_present: bool) -> Result<(), NullifierError> {
     if already_present {
         Err(NullifierError::AlreadyClaimed)
@@ -41,13 +49,21 @@ pub enum AccessError {
 /// wins the label even if a regulator happens to also be the issuer or bank,
 /// because the log's job is to flag every possible disclosure event, not to
 /// pick the "most convenient" explanation for a given call.
+///
+/// Takes `caller_is_regulator` as a pre-resolved bool rather than the full
+/// regulator list (round 3 review, §4): the canister's regulator set lives
+/// in a `StableBTreeMap` keyed by principal, so the caller should do a
+/// direct `contains_key` lookup (O(log n)) rather than materializing the
+/// entire set into a `Vec` on every single key derivation or audit-log
+/// read, which was a full linear scan regardless of how large the
+/// regulator set grew.
 pub fn resolve_access(
     caller: &CallerId,
     issuer: &CallerId,
     bank: &Option<CallerId>,
-    regulators: &[CallerId],
+    caller_is_regulator: bool,
 ) -> Result<AccessRole, AccessError> {
-    if regulators.iter().any(|r| r == caller) {
+    if caller_is_regulator {
         return Ok(AccessRole::Regulator);
     }
     if caller == issuer {
@@ -112,10 +128,11 @@ pub fn check_rate_limit(
     }
 }
 
-/// Payload-size guard: reject ciphertext uploads above a configured cap so a
-/// single caller can't inflate paid stable-memory storage with arbitrary
-/// blobs. Kept as a pure function so the threshold logic has a single
-/// tested home even though the byte slice itself lives in the canister.
+/// Payload-size guard: reject any caller-supplied byte/string field above a
+/// configured cap. Used for ciphertext (storage-inflation defense) and for
+/// bounded-length identifier fields like `invoice_id` (same defense,
+/// different field) so a single size-check function has one tested home
+/// rather than being duplicated per call site.
 pub fn check_payload_size(payload_len: usize, max_bytes: usize) -> Result<(), String> {
     if payload_len > max_bytes {
         Err(format!(
@@ -126,56 +143,22 @@ pub fn check_payload_size(payload_len: usize, max_bytes: usize) -> Result<(), St
     }
 }
 
-/// Minimum cycles that must be attached to a key-derivation request. This is
-/// the economic complement to the per-principal rate limit: per-principal
-/// limits are trivially bypassed by spinning up fresh principals (Sybil
-/// attack), but every principal still has to pay per attempt, which makes
-/// mass key-derivation spam cost real money instead of being free.
-pub const MIN_DERIVE_KEY_FEE_CYCLES: u128 = 1_000_000_000; // 1B cycles ≈ $0.001
-
-/// Decide whether the cycles attached to an incoming call cover the required
-/// fee. Pure so the threshold semantics have one tested home; the canister
-/// supplies `msg_cycles_available()` and accepts the fee only after this and
-/// all other authorization checks pass.
-pub fn check_cycles_fee(attached_cycles: u128, required: u128) -> Result<(), String> {
-    if attached_cycles < required {
+/// Sanity-bounds a caller-supplied transport public key's length before it's
+/// forwarded to the vetKD system API. This is intentionally a loose range
+/// check, not an exact-length assertion: confirm the precise expected byte
+/// length against the version of `@dfinity/vetkeys` / `ic_vetkd_sdk_utils`
+/// you pin, and tighten `min`/`max` to that exact value once confirmed --
+/// a loose bound still stops a wildly malformed or unbounded-size blob from
+/// being forwarded, but an exact check catches malformed keys earlier and
+/// more precisely.
+pub fn check_transport_key_length(len: usize, min: usize, max: usize) -> Result<(), String> {
+    if len < min || len > max {
         Err(format!(
-            "insufficient cycles attached: key derivation requires at least {required} cycles, got {attached_cycles}"
+            "transport public key length {len} is outside the expected [{min}, {max}] byte range"
         ))
     } else {
         Ok(())
     }
-}
-
-// ---------------------------------------------------------------------------
-// Identifier validation. Client-supplied identifiers are free-form strings;
-// without a binding to an authoritative system of record we at least enforce
-// a strict format so keys stay bounded and printable.
-// ---------------------------------------------------------------------------
-
-pub const MAX_INVOICE_ID_LEN: usize = 64;
-pub const MAX_NULLIFIER_LEN: usize = 128;
-
-/// Validate a caller-supplied identifier: non-empty, within `max_len`, and
-/// restricted to ASCII alphanumeric plus `-_.:` (covers hex hashes, UUIDs,
-/// and dotted schemes; excludes whitespace/control chars and shell-hostile
-/// characters).
-pub fn validate_identifier(value: &str, field: &str, max_len: usize) -> Result<(), String> {
-    if value.is_empty() {
-        return Err(format!("{field} must not be empty"));
-    }
-    if value.len() > max_len {
-        return Err(format!("{field} exceeds the {max_len}-character limit"));
-    }
-    if !value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
-    {
-        return Err(format!(
-            "{field} may only contain ASCII letters, digits, and -_.:"
-        ));
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -208,12 +191,6 @@ struct Invoice {
     issuer: CallerId,
     bank: Option<CallerId>,
     status: InvoiceStatus,
-    // Set by raise_dispute; a raised dispute is permanent metadata -- it is
-    // recorded in the audit log forever even though dispute *resolution* is
-    // out of scope for this canister (see README).
-    disputed: bool,
-    // true once the ciphertext payload has been pruned; record + audit remain.
-    ciphertext_pruned: bool,
     // Kept for future use (e.g. reporting/expiry-of-unsettled-invoices
     // policies) even though no current rule reads it yet.
     #[allow(dead_code)]
@@ -224,7 +201,7 @@ struct Invoice {
 #[derive(Debug, Default)]
 pub struct ProtocolState {
     admin: Option<CallerId>,
-    nullifiers: HashSet<String>,
+    nullifiers: HashSet<Nullifier>,
     invoices: HashMap<String, Invoice>,
     regulators: HashSet<CallerId>,
     audit_log: Vec<AuditEvent>,
@@ -250,8 +227,12 @@ impl ProtocolState {
         self.audit_log.push(event);
     }
 
+    fn is_admin(&self, caller: &CallerId) -> bool {
+        self.admin.as_ref() == Some(caller)
+    }
+
     pub fn register_regulator(&mut self, caller: &CallerId, regulator: CallerId) -> Result<(), String> {
-        if self.admin.as_ref() != Some(caller) {
+        if !self.is_admin(caller) {
             return Err("only the admin can register regulators".to_string());
         }
         self.regulators.insert(regulator);
@@ -263,7 +244,7 @@ impl ProtocolState {
     /// principal was never registered, so callers can't get a silent no-op
     /// that looks like a successful revoke.
     pub fn revoke_regulator(&mut self, caller: &CallerId, regulator: &CallerId) -> Result<(), String> {
-        if self.admin.as_ref() != Some(caller) {
+        if !self.is_admin(caller) {
             return Err("only the admin can revoke regulators".to_string());
         }
         if !self.regulators.remove(regulator) {
@@ -273,37 +254,82 @@ impl ProtocolState {
         Ok(())
     }
 
+    /// Admin-only rotation of the admin identity itself. Without this, a
+    /// lost or compromised admin key is a permanent lockout on every
+    /// admin-gated operation (registering/revoking regulators, and this
+    /// rotation itself). Logged like any other privileged action, since
+    /// "who controls this canister's admin role changed" is exactly the
+    /// kind of event an auditor should be able to see.
+    pub fn transfer_admin(&mut self, caller: &CallerId, new_admin: CallerId) -> Result<(), String> {
+        if !self.is_admin(caller) {
+            return Err("only the current admin can transfer adminship".to_string());
+        }
+        self.admin = Some(new_admin);
+        self.log("*", caller, "admin_rotated");
+        Ok(())
+    }
+
+    /// Registers an invoice under a nullifier *derived by this function*
+    /// from the caller-declared `fingerprint`, not supplied directly by the
+    /// caller. See `nullifier.rs` for why that distinction is the whole
+    /// point: a caller-chosen nullifier can always be "fresh," which makes
+    /// double-financing prevention meaningless. Returns the derived
+    /// nullifier on success so the caller can be given a receipt/reference
+    /// without the canister ever persisting the underlying fields.
+    /// Registers an invoice, deriving the nullifier from `fingerprint`
+    /// rather than accepting a caller-chosen one (see the module docs on
+    /// `nullifier` for why).
+    ///
+    /// **Rejections past field validation are deliberately generic**
+    /// (round 3 review, §1; this executable spec was brought back in sync
+    /// with that fix during round 5's audit, having drifted out of sync
+    /// with `ciphersettle_backend`'s copy of this same logic when the
+    /// round-3 fix was applied only to the canister and not mirrored here
+    /// -- exactly the kind of gap that "treat this as the executable spec,
+    /// change it first" is meant to prevent, caught only by deliberately
+    /// re-testing the spec against the fixed behavior instead of assuming
+    /// it already matched). A duplicate nullifier and a duplicate
+    /// `invoice_id` both return the same generic error, since
+    /// distinguishing them to a caller with no other credential would make
+    /// this function usable to test whether a guessed invoice already
+    /// exists. The specific reason is still recorded via `self.log` under
+    /// invoice_id `"*"`.
     pub fn register_invoice(
         &mut self,
         caller: &CallerId,
         invoice_id: String,
-        nullifier_hash: String,
+        fingerprint: &InvoiceFingerprint,
         created_at: u64,
-    ) -> Result<(), String> {
-        validate_identifier(&invoice_id, "invoice_id", MAX_INVOICE_ID_LEN)?;
-        validate_identifier(&nullifier_hash, "nullifier_hash", MAX_NULLIFIER_LEN)?;
-        let already_claimed = self.nullifiers.contains(&nullifier_hash);
-        check_nullifier(already_claimed).map_err(|_| {
-            "nullifier already registered: invoice already submitted elsewhere".to_string()
-        })?;
-        if self.invoices.contains_key(&invoice_id) {
-            return Err("invoice_id already exists".to_string());
+    ) -> Result<Nullifier, String> {
+        let nullifier = compute_nullifier(fingerprint)
+            .map_err(|e| format!("invalid invoice fingerprint: {e:?}"))?;
+
+        let already_claimed = self.nullifiers.contains(&nullifier);
+        let invoice_id_taken = self.invoices.contains_key(&invoice_id);
+
+        if already_claimed || invoice_id_taken {
+            let reason = if already_claimed {
+                "registration_rejected_duplicate_fingerprint"
+            } else {
+                "registration_rejected_duplicate_invoice_id"
+            };
+            self.log("*", caller, reason);
+            return Err("registration was not completed".to_string());
         }
-        self.nullifiers.insert(nullifier_hash);
+
+        self.nullifiers.insert(nullifier);
         self.invoices.insert(
             invoice_id.clone(),
             Invoice {
                 issuer: caller.clone(),
                 bank: None,
                 status: InvoiceStatus::Active,
-                disputed: false,
-                ciphertext_pruned: false,
                 created_at,
                 settled_at: None,
             },
         );
         self.log(&invoice_id, caller, "invoice_registered");
-        Ok(())
+        Ok(nullifier)
     }
 
     pub fn grant_settlement_access(
@@ -349,14 +375,8 @@ impl ProtocolState {
         Ok(())
     }
 
-    /// Decide whether `caller` may derive a decryption key for this invoice,
-    /// and under which role the outcome should be logged. **Does not write to
-    /// the audit log** -- authorization happens before the (async, fallible)
-    /// key derivation runs; call `record_key_derivation_success` or
-    /// `record_key_derivation_failure` afterwards so the audit trail reflects
-    /// what actually happened rather than what was merely attempted.
-    pub fn authorize_key_access(
-        &self,
+    pub fn request_key_access(
+        &mut self,
         caller: &CallerId,
         invoice_id: &str,
     ) -> Result<AccessRole, String> {
@@ -364,28 +384,10 @@ impl ProtocolState {
             .invoices
             .get(invoice_id)
             .ok_or_else(|| "invoice not found".to_string())?;
-        let regulators: Vec<CallerId> = self.regulators.iter().cloned().collect();
-        resolve_access(caller, &invoice.issuer, &invoice.bank, &regulators)
-            .map_err(|_| "not authorized to derive a decryption key for this invoice".to_string())
-    }
-
-    /// Audit-log a successful key derivation under the authorized role's
-    /// action (`key_derived_bank` / `key_derived_issuer` /
-    /// `disclosure_request`).
-    pub fn record_key_derivation_success(
-        &mut self,
-        caller: &CallerId,
-        invoice_id: &str,
-        role: AccessRole,
-    ) {
+        let role = resolve_access(caller, &invoice.issuer, &invoice.bank, self.regulators.contains(caller))
+            .map_err(|_| "not authorized to derive a decryption key for this invoice".to_string())?;
         self.log(invoice_id, caller, audit_action_for(&role));
-    }
-
-    /// Audit-log a failed key derivation for an otherwise-authorized caller
-    /// (e.g. the vetKD round-trip rejected). Kept distinct from the success
-    /// actions so the log can't over-report completed disclosures.
-    pub fn record_key_derivation_failure(&mut self, caller: &CallerId, invoice_id: &str) {
-        self.log(invoice_id, caller, "key_derivation_failed");
+        Ok(role)
     }
 
     /// Issuer or the currently-granted bank may mark an invoice settled.
@@ -441,67 +443,53 @@ impl ProtocolState {
         }
     }
 
-    /// Raise an on-chain dispute flag over an invoice's content. Callable by
-    /// protocol participants (issuer, currently-granted bank) or a registered
-    /// regulator -- not by arbitrary callers, so the flag can't be spammed by
-    /// strangers. This records *that* a dispute exists (permanently, via the
-    /// audit log and the invoice record); resolving one is out of scope for
-    /// this canister.
-    pub fn raise_dispute(&mut self, caller: &CallerId, invoice_id: &str) -> Result<(), String> {
-        let invoice = self
-            .invoices
-            .get_mut(invoice_id)
-            .ok_or_else(|| "invoice not found".to_string())?;
-        let is_participant = &invoice.issuer == caller || invoice.bank.as_ref() == Some(caller);
-        if !is_participant && !self.regulators.contains(caller) {
-            return Err(
-                "only the issuer, the granted bank, or a registered regulator can raise a dispute"
-                    .to_string(),
-            );
-        }
-        if invoice.disputed {
-            return Err("a dispute is already open for this invoice".to_string());
-        }
-        invoice.disputed = true;
-        self.log(invoice_id, caller, "dispute_raised");
-        Ok(())
-    }
-
-    /// Admin-only drop of a settled invoice's ciphertext payload once it is
-    /// past the retention window. Gated on identity first (so unauthorized
-    /// callers get a clear denial regardless of eligibility), then on the
-    /// same eligibility rule as `is_eligible_for_ciphertext_pruning`. The
-    /// record and its audit trail are kept; only the payload bytes go.
-    pub fn prune_ciphertext(
-        &mut self,
-        caller: &CallerId,
-        invoice_id: &str,
-        now: u64,
-        retention_nanos: u64,
-    ) -> Result<(), String> {
-        if self.admin.as_ref() != Some(caller) {
-            return Err("only the admin can prune ciphertext".to_string());
-        }
-        if !self.is_eligible_for_ciphertext_pruning(invoice_id, now, retention_nanos) {
-            return Err(
-                "invoice is not yet eligible for pruning (must be settled and past the retention window)"
-                    .to_string(),
-            );
-        }
-        let invoice = self.invoices.get_mut(invoice_id).expect("checked above");
-        if invoice.ciphertext_pruned {
-            return Err("ciphertext already pruned for this invoice".to_string());
-        }
-        invoice.ciphertext_pruned = true;
-        self.log(invoice_id, caller, "ciphertext_pruned");
-        Ok(())
-    }
-
-    pub fn audit_log(&self, invoice_id: Option<&str>) -> Vec<&AuditEvent> {
+    /// Unchecked accessor -- returns every matching event regardless of who
+    /// is asking. Kept `pub(crate)` (not exported) so nothing outside this
+    /// crate can bypass `get_audit_log_authorized` by mistake; use that
+    /// instead from the canister.
+    fn audit_log(&self, invoice_id: Option<&str>) -> Vec<&AuditEvent> {
         self.audit_log
             .iter()
-            .filter(|e| invoice_id.is_none_or(|id| e.invoice_id == id))
+            .filter(|e| invoice_id.map_or(true, |id| e.invoice_id == id))
             .collect()
+    }
+
+    /// Access-checked audit log read.
+    ///
+    /// - Per-invoice (`invoice_id = Some(..)`): the admin, the invoice's
+    ///   issuer, its currently-granted bank, or any registered regulator may
+    ///   read that invoice's events. Everyone else is denied -- an
+    ///   unauthenticated global broadcast of "who granted access to whom,
+    ///   and when a regulator investigated which invoice" is exactly the
+    ///   metadata leak this method exists to close.
+    /// - Unscoped (`invoice_id = None`): admin only. A full cross-invoice
+    ///   listing reveals the entire relationship graph (every issuer/bank
+    ///   pairing, every disclosure event, across every invoice at once),
+    ///   which is a strictly bigger leak than any single invoice's log and
+    ///   isn't needed by any role other than the operator.
+    pub fn get_audit_log_authorized(
+        &self,
+        caller: &CallerId,
+        invoice_id: Option<&str>,
+    ) -> Result<Vec<&AuditEvent>, String> {
+        if self.is_admin(caller) {
+            return Ok(self.audit_log(invoice_id));
+        }
+        match invoice_id {
+            None => Err(
+                "only the admin can read the unscoped audit log; request a specific invoice_id instead"
+                    .to_string(),
+            ),
+            Some(id) => {
+                let invoice = self
+                    .invoices
+                    .get(id)
+                    .ok_or_else(|| "invoice not found".to_string())?;
+                resolve_access(caller, &invoice.issuer, &invoice.bank, self.regulators.contains(caller))
+                    .map_err(|_| "not authorized to view the audit log for this invoice".to_string())?;
+                Ok(self.audit_log(Some(id)))
+            }
+        }
     }
 }
 
@@ -509,20 +497,29 @@ impl ProtocolState {
 mod state_tests {
     use super::*;
 
+    fn fp(issuer: &str, invoice_number: &str) -> InvoiceFingerprint {
+        InvoiceFingerprint {
+            issuer_identifier: issuer.to_string(),
+            invoice_number: invoice_number.to_string(),
+            currency_code: "USD".to_string(),
+            amount_minor_units: 10_000,
+            due_date_unix: 1_800_000_000,
+        }
+    }
+
     #[test]
     fn full_lifecycle_issuer_registers_grants_and_bank_derives() {
         let mut state = ProtocolState::new("admin".to_string());
         state
-            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), "null-1".to_string(), 0)
+            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), &fp("issuer-1", "INV-1"), 0)
             .unwrap();
         state
             .grant_settlement_access(&"issuer-1".to_string(), "inv-1", "bank-1".to_string())
             .unwrap();
         let role = state
-            .authorize_key_access(&"bank-1".to_string(), "inv-1")
+            .request_key_access(&"bank-1".to_string(), "inv-1")
             .unwrap();
         assert_eq!(role, AccessRole::Bank);
-        state.record_key_derivation_success(&"bank-1".to_string(), "inv-1", role);
 
         let log = state.audit_log(Some("inv-1"));
         let actions: Vec<&str> = log.iter().map(|e| e.action.as_str()).collect();
@@ -533,40 +530,108 @@ mod state_tests {
     }
 
     #[test]
-    fn duplicate_nullifier_blocks_second_invoice() {
+    fn duplicate_fingerprint_blocks_second_invoice_even_under_a_different_id() {
+        // Same declared identifying fields, submitted under two different
+        // invoice_ids and by two different callers -- this is exactly the
+        // double-financing pattern the nullifier exists to catch.
         let mut state = ProtocolState::new("admin".to_string());
         state
-            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), "shared-null".to_string(), 0)
+            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), &fp("issuer-1", "INV-1"), 0)
             .unwrap();
         let result = state.register_invoice(
             &"issuer-2".to_string(),
             "inv-2".to_string(),
-            "shared-null".to_string(),
+            &fp("issuer-1", "INV-1"),
             0,
         );
         assert!(result.is_err());
     }
 
     #[test]
-    fn duplicate_invoice_id_is_rejected_even_with_new_nullifier() {
+    fn duplicate_invoice_id_is_rejected_even_with_a_different_fingerprint() {
         let mut state = ProtocolState::new("admin".to_string());
         state
-            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), "null-a".to_string(), 0)
+            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), &fp("issuer-1", "INV-1"), 0)
             .unwrap();
         let result = state.register_invoice(
             &"issuer-1".to_string(),
             "inv-1".to_string(),
-            "null-b".to_string(),
+            &fp("issuer-1", "INV-2"),
             0,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn duplicate_fingerprint_and_duplicate_invoice_id_produce_the_same_error_message() {
+        // Round 5 audit: ProtocolState is documented (README) as the
+        // executable spec to change first, but round 3's oracle fix
+        // (collapsing these two rejection reasons into one indistinguishable
+        // message -- see the doc comment on register_invoice) had only ever
+        // been applied to ciphersettle_backend directly, never mirrored back
+        // into this spec. This test locks in that the two messages are
+        // identical here too, so the spec can't silently drift from the
+        // deployed behavior on this point again.
+        let mut state = ProtocolState::new("admin".to_string());
+        state
+            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), &fp("issuer-1", "INV-1"), 0)
+            .unwrap();
+
+        let duplicate_fingerprint_err = state
+            .register_invoice(&"issuer-2".to_string(), "inv-2".to_string(), &fp("issuer-1", "INV-1"), 0)
+            .unwrap_err();
+        let duplicate_id_err = state
+            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), &fp("issuer-1", "INV-2"), 0)
+            .unwrap_err();
+
+        assert_eq!(duplicate_fingerprint_err, duplicate_id_err);
+        assert_eq!(duplicate_fingerprint_err, "registration was not completed");
+    }
+
+    #[test]
+    fn duplicate_registration_rejection_reason_is_still_logged_for_admin_diagnosis() {
+        // The generic error is deliberately uninformative to the caller,
+        // but the specific reason must still reach the audit log (under the
+        // reserved "*" invoice_id, the same convention used for
+        // non-invoice-scoped admin actions) so a legitimate operator can
+        // still diagnose a rejected submission -- only an anonymous prober
+        // learns nothing.
+        let mut state = ProtocolState::new("admin".to_string());
+        state
+            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), &fp("issuer-1", "INV-1"), 0)
+            .unwrap();
+        let _ = state.register_invoice(&"issuer-2".to_string(), "inv-2".to_string(), &fp("issuer-1", "INV-1"), 0);
+
+        let unscoped = state.get_audit_log_authorized(&"admin".to_string(), None).unwrap();
+        let logged_reasons: Vec<&str> = unscoped
+            .iter()
+            .filter(|e| e.invoice_id == "*")
+            .map(|e| e.action.as_str())
+            .collect();
+        assert!(logged_reasons.contains(&"registration_rejected_duplicate_fingerprint"));
+    }
+
+    #[test]
+    fn invalid_fingerprint_is_rejected_before_any_state_changes() {
+        let mut state = ProtocolState::new("admin".to_string());
+        let bad = InvoiceFingerprint {
+            issuer_identifier: "".to_string(), // empty -> invalid
+            invoice_number: "INV-1".to_string(),
+            currency_code: "USD".to_string(),
+            amount_minor_units: 1,
+            due_date_unix: 1,
+        };
+        let result = state.register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), &bad, 0);
+        assert!(result.is_err());
+        // and it must not have partially registered anything
+        assert!(state.audit_log(None).is_empty());
     }
 
     #[test]
     fn non_issuer_cannot_grant_settlement_access() {
         let mut state = ProtocolState::new("admin".to_string());
         state
-            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), "null-1".to_string(), 0)
+            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), &fp("issuer-1", "INV-1"), 0)
             .unwrap();
         let result =
             state.grant_settlement_access(&"attacker".to_string(), "inv-1", "bank-1".to_string());
@@ -587,13 +652,12 @@ mod state_tests {
             .register_regulator(&"admin".to_string(), "regulator-1".to_string())
             .unwrap();
         state
-            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), "null-1".to_string(), 0)
+            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), &fp("issuer-1", "INV-1"), 0)
             .unwrap();
         let role = state
-            .authorize_key_access(&"regulator-1".to_string(), "inv-1")
+            .request_key_access(&"regulator-1".to_string(), "inv-1")
             .unwrap();
         assert_eq!(role, AccessRole::Regulator);
-        state.record_key_derivation_success(&"regulator-1".to_string(), "inv-1", role);
         let log = state.audit_log(Some("inv-1"));
         assert!(log.iter().any(|e| e.action == "disclosure_request"));
     }
@@ -602,10 +666,10 @@ mod state_tests {
     fn unrelated_invoice_events_are_excluded_by_filter() {
         let mut state = ProtocolState::new("admin".to_string());
         state
-            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), "null-1".to_string(), 0)
+            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), &fp("issuer-1", "INV-1"), 0)
             .unwrap();
         state
-            .register_invoice(&"issuer-2".to_string(), "inv-2".to_string(), "null-2".to_string(), 0)
+            .register_invoice(&"issuer-2".to_string(), "inv-2".to_string(), &fp("issuer-2", "INV-1"), 0)
             .unwrap();
         let log = state.audit_log(Some("inv-1"));
         assert_eq!(log.len(), 1);
@@ -618,7 +682,7 @@ mod state_tests {
     fn issuer_can_revoke_previously_granted_bank_access() {
         let mut state = ProtocolState::new("admin".to_string());
         state
-            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), "null-1".to_string(), 0)
+            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), &fp("issuer-1", "INV-1"), 0)
             .unwrap();
         state
             .grant_settlement_access(&"issuer-1".to_string(), "inv-1", "bank-1".to_string())
@@ -628,7 +692,7 @@ mod state_tests {
             .unwrap();
 
         // the revoked bank can no longer derive a key
-        let result = state.authorize_key_access(&"bank-1".to_string(), "inv-1");
+        let result = state.request_key_access(&"bank-1".to_string(), "inv-1");
         assert!(result.is_err());
     }
 
@@ -636,7 +700,7 @@ mod state_tests {
     fn revoking_settlement_access_with_nothing_granted_is_an_error_not_a_noop() {
         let mut state = ProtocolState::new("admin".to_string());
         state
-            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), "null-1".to_string(), 0)
+            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), &fp("issuer-1", "INV-1"), 0)
             .unwrap();
         let result = state.revoke_settlement_access(&"issuer-1".to_string(), "inv-1");
         assert!(result.is_err());
@@ -646,7 +710,7 @@ mod state_tests {
     fn non_issuer_cannot_revoke_settlement_access() {
         let mut state = ProtocolState::new("admin".to_string());
         state
-            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), "null-1".to_string(), 0)
+            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), &fp("issuer-1", "INV-1"), 0)
             .unwrap();
         state
             .grant_settlement_access(&"issuer-1".to_string(), "inv-1", "bank-1".to_string())
@@ -659,7 +723,7 @@ mod state_tests {
     fn issuer_can_regrant_after_revoking() {
         let mut state = ProtocolState::new("admin".to_string());
         state
-            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), "null-1".to_string(), 0)
+            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), &fp("issuer-1", "INV-1"), 0)
             .unwrap();
         state
             .grant_settlement_access(&"issuer-1".to_string(), "inv-1", "bank-1".to_string())
@@ -671,7 +735,7 @@ mod state_tests {
             .grant_settlement_access(&"issuer-1".to_string(), "inv-1", "bank-2".to_string())
             .unwrap();
         let role = state
-            .authorize_key_access(&"bank-2".to_string(), "inv-1")
+            .request_key_access(&"bank-2".to_string(), "inv-1")
             .unwrap();
         assert_eq!(role, AccessRole::Bank);
     }
@@ -683,13 +747,13 @@ mod state_tests {
             .register_regulator(&"admin".to_string(), "regulator-1".to_string())
             .unwrap();
         state
-            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), "null-1".to_string(), 0)
+            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), &fp("issuer-1", "INV-1"), 0)
             .unwrap();
         state
             .revoke_regulator(&"admin".to_string(), &"regulator-1".to_string())
             .unwrap();
         // revoked regulator no longer gets disclosure access
-        let result = state.authorize_key_access(&"regulator-1".to_string(), "inv-1");
+        let result = state.request_key_access(&"regulator-1".to_string(), "inv-1");
         assert!(result.is_err());
     }
 
@@ -710,13 +774,39 @@ mod state_tests {
         assert!(result.is_err());
     }
 
+    // ---- Admin rotation ----
+
+    #[test]
+    fn admin_can_transfer_adminship() {
+        let mut state = ProtocolState::new("admin".to_string());
+        state
+            .transfer_admin(&"admin".to_string(), "new-admin".to_string())
+            .unwrap();
+        // old admin can no longer perform admin-only actions
+        let result = state.register_regulator(&"admin".to_string(), "regulator-1".to_string());
+        assert!(result.is_err());
+        // new admin can
+        state
+            .register_regulator(&"new-admin".to_string(), "regulator-1".to_string())
+            .unwrap();
+    }
+
+    #[test]
+    fn non_admin_cannot_transfer_adminship() {
+        let mut state = ProtocolState::new("admin".to_string());
+        let result = state.transfer_admin(&"attacker".to_string(), "attacker".to_string());
+        assert!(result.is_err());
+        // admin is unchanged
+        assert!(state.register_regulator(&"admin".to_string(), "regulator-1".to_string()).is_ok());
+    }
+
     // ---- Settlement lifecycle & pruning eligibility ----
 
     #[test]
     fn issuer_or_bank_can_mark_settled() {
         let mut state = ProtocolState::new("admin".to_string());
         state
-            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), "null-1".to_string(), 0)
+            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), &fp("issuer-1", "INV-1"), 0)
             .unwrap();
         state
             .grant_settlement_access(&"issuer-1".to_string(), "inv-1", "bank-1".to_string())
@@ -730,7 +820,7 @@ mod state_tests {
     fn stranger_cannot_mark_settled() {
         let mut state = ProtocolState::new("admin".to_string());
         state
-            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), "null-1".to_string(), 0)
+            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), &fp("issuer-1", "INV-1"), 0)
             .unwrap();
         let result = state.mark_settled(&"stranger".to_string(), "inv-1", 1_000);
         assert!(result.is_err());
@@ -740,7 +830,7 @@ mod state_tests {
     fn double_settlement_is_rejected() {
         let mut state = ProtocolState::new("admin".to_string());
         state
-            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), "null-1".to_string(), 0)
+            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), &fp("issuer-1", "INV-1"), 0)
             .unwrap();
         state.mark_settled(&"issuer-1".to_string(), "inv-1", 1_000).unwrap();
         let result = state.mark_settled(&"issuer-1".to_string(), "inv-1", 2_000);
@@ -751,7 +841,7 @@ mod state_tests {
     fn active_invoice_is_never_prune_eligible_regardless_of_age() {
         let mut state = ProtocolState::new("admin".to_string());
         state
-            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), "null-1".to_string(), 0)
+            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), &fp("issuer-1", "INV-1"), 0)
             .unwrap();
         let far_future = 999_999_999_999u64;
         assert!(!state.is_eligible_for_ciphertext_pruning("inv-1", far_future, 1));
@@ -761,7 +851,7 @@ mod state_tests {
     fn settled_invoice_is_prune_eligible_only_after_retention_window() {
         let mut state = ProtocolState::new("admin".to_string());
         state
-            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), "null-1".to_string(), 0)
+            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), &fp("issuer-1", "INV-1"), 0)
             .unwrap();
         state.mark_settled(&"issuer-1".to_string(), "inv-1", 1_000).unwrap();
 
@@ -777,143 +867,87 @@ mod state_tests {
         assert!(!state.is_eligible_for_ciphertext_pruning("does-not-exist", 1_000_000, 1));
     }
 
-    // ---- Disputes ----
+    // ---- Gated audit log access ----
 
-    fn settled_invoice_state() -> ProtocolState {
+    #[test]
+    fn issuer_can_read_their_own_invoices_audit_log() {
         let mut state = ProtocolState::new("admin".to_string());
         state
-            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), "null-1".to_string(), 0)
+            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), &fp("issuer-1", "INV-1"), 0)
+            .unwrap();
+        let log = state
+            .get_audit_log_authorized(&"issuer-1".to_string(), Some("inv-1"))
+            .unwrap();
+        assert_eq!(log.len(), 1);
+    }
+
+    #[test]
+    fn granted_bank_can_read_the_invoices_audit_log() {
+        let mut state = ProtocolState::new("admin".to_string());
+        state
+            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), &fp("issuer-1", "INV-1"), 0)
             .unwrap();
         state
             .grant_settlement_access(&"issuer-1".to_string(), "inv-1", "bank-1".to_string())
             .unwrap();
-        state.mark_settled(&"bank-1".to_string(), "inv-1", 1_000).unwrap();
-        state
+        let log = state
+            .get_audit_log_authorized(&"bank-1".to_string(), Some("inv-1"))
+            .unwrap();
+        assert!(!log.is_empty());
     }
 
     #[test]
-    fn issuer_can_raise_dispute_and_it_is_logged() {
-        let mut state = ProtocolState::new("admin".to_string());
-        state
-            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), "null-1".to_string(), 0)
-            .unwrap();
-        state.raise_dispute(&"issuer-1".to_string(), "inv-1").unwrap();
-        let log = state.audit_log(Some("inv-1"));
-        assert!(
-            log.iter()
-                .any(|e| e.action == "dispute_raised" && e.actor == "issuer-1")
-        );
-    }
-
-    #[test]
-    fn granted_bank_can_raise_dispute() {
-        let mut state = ProtocolState::new("admin".to_string());
-        state
-            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), "null-1".to_string(), 0)
-            .unwrap();
-        state
-            .grant_settlement_access(&"issuer-1".to_string(), "inv-1", "bank-1".to_string())
-            .unwrap();
-        state.raise_dispute(&"bank-1".to_string(), "inv-1").unwrap();
-    }
-
-    #[test]
-    fn registered_regulator_can_raise_dispute() {
+    fn registered_regulator_can_read_any_invoices_audit_log() {
         let mut state = ProtocolState::new("admin".to_string());
         state
             .register_regulator(&"admin".to_string(), "regulator-1".to_string())
             .unwrap();
         state
-            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), "null-1".to_string(), 0)
+            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), &fp("issuer-1", "INV-1"), 0)
             .unwrap();
-        state.raise_dispute(&"regulator-1".to_string(), "inv-1").unwrap();
+        let log = state
+            .get_audit_log_authorized(&"regulator-1".to_string(), Some("inv-1"))
+            .unwrap();
+        assert!(!log.is_empty());
     }
 
     #[test]
-    fn stranger_cannot_raise_dispute() {
+    fn unrelated_caller_cannot_read_an_invoices_audit_log() {
         let mut state = ProtocolState::new("admin".to_string());
         state
-            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), "null-1".to_string(), 0)
+            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), &fp("issuer-1", "INV-1"), 0)
             .unwrap();
-        assert!(state.raise_dispute(&"stranger".to_string(), "inv-1").is_err());
-    }
-
-    #[test]
-    fn double_dispute_is_rejected() {
-        let mut state = ProtocolState::new("admin".to_string());
-        state
-            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), "null-1".to_string(), 0)
-            .unwrap();
-        state.raise_dispute(&"issuer-1".to_string(), "inv-1").unwrap();
-        assert!(state.raise_dispute(&"issuer-1".to_string(), "inv-1").is_err());
-    }
-
-    #[test]
-    fn dispute_survives_settlement() {
-        // The dispute flag is permanent metadata: settling afterwards must
-        // not silently clear it.
-        let mut state = ProtocolState::new("admin".to_string());
-        state
-            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), "null-1".to_string(), 0)
-            .unwrap();
-        state.raise_dispute(&"issuer-1".to_string(), "inv-1").unwrap();
-        state.mark_settled(&"issuer-1".to_string(), "inv-1", 1_000).unwrap();
-        let log = state.audit_log(Some("inv-1"));
-        assert!(log.iter().any(|e| e.action == "dispute_raised"));
-        assert!(log.iter().any(|e| e.action == "invoice_settled"));
-    }
-
-    // ---- Admin-gated pruning ----
-
-    #[test]
-    fn non_admin_cannot_prune_even_when_eligible() {
-        let mut state = settled_invoice_state();
-        let result = state.prune_ciphertext(&"issuer-1".to_string(), "inv-1", 5_000, 500);
-        assert!(result.is_err());
-        let result = state.prune_ciphertext(&"bank-1".to_string(), "inv-1", 5_000, 500);
+        let result = state.get_audit_log_authorized(&"stranger".to_string(), Some("inv-1"));
         assert!(result.is_err());
     }
 
     #[test]
-    fn admin_cannot_prune_before_retention_window() {
-        let mut state = settled_invoice_state();
-        let result = state.prune_ciphertext(&"admin".to_string(), "inv-1", 1_200, 500);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn admin_cannot_prune_active_invoice() {
+    fn admin_can_read_any_invoices_audit_log() {
         let mut state = ProtocolState::new("admin".to_string());
         state
-            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), "null-1".to_string(), 0)
+            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), &fp("issuer-1", "INV-1"), 0)
             .unwrap();
-        assert!(state.prune_ciphertext(&"admin".to_string(), "inv-1", 9_999, 1).is_err());
+        let log = state
+            .get_audit_log_authorized(&"admin".to_string(), Some("inv-1"))
+            .unwrap();
+        assert!(!log.is_empty());
     }
 
     #[test]
-    fn admin_can_prune_after_retention_window() {
-        let mut state = settled_invoice_state();
-        state.prune_ciphertext(&"admin".to_string(), "inv-1", 1_500, 500).unwrap();
-        let log = state.audit_log(Some("inv-1"));
-        assert!(log.iter().any(|e| e.action == "ciphertext_pruned"));
-    }
-
-    #[test]
-    fn double_prune_is_rejected() {
-        let mut state = settled_invoice_state();
-        state.prune_ciphertext(&"admin".to_string(), "inv-1", 1_500, 500).unwrap();
-        assert!(state.prune_ciphertext(&"admin".to_string(), "inv-1", 1_600, 500).is_err());
-    }
-
-    #[test]
-    fn admin_identity_is_required_for_new_states() {
-        // prune must be impossible on a state constructed without an admin.
-        let mut state = ProtocolState::default();
+    fn only_admin_can_read_the_unscoped_audit_log() {
+        let mut state = ProtocolState::new("admin".to_string());
         state
-            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), "null-1".to_string(), 0)
+            .register_invoice(&"issuer-1".to_string(), "inv-1".to_string(), &fp("issuer-1", "INV-1"), 0)
             .unwrap();
-        state.mark_settled(&"issuer-1".to_string(), "inv-1", 1_000).unwrap();
-        assert!(state.prune_ciphertext(&"issuer-1".to_string(), "inv-1", 9_999, 1).is_err());
+        assert!(state.get_audit_log_authorized(&"admin".to_string(), None).is_ok());
+        assert!(state.get_audit_log_authorized(&"issuer-1".to_string(), None).is_err());
+    }
+
+    #[test]
+    fn reading_audit_log_for_unknown_invoice_is_an_error() {
+        let state = ProtocolState::new("admin".to_string());
+        let result = state.get_audit_log_authorized(&"issuer-1".to_string(), Some("does-not-exist"));
+        assert!(result.is_err());
     }
 }
 
@@ -934,7 +968,7 @@ mod tests {
     #[test]
     fn issuer_is_granted_access() {
         let issuer = "issuer-1".to_string();
-        let role = resolve_access(&issuer, &issuer, &None, &[]).unwrap();
+        let role = resolve_access(&issuer, &issuer, &None, false).unwrap();
         assert_eq!(role, AccessRole::Issuer);
         assert_eq!(audit_action_for(&role), "key_derived_issuer");
     }
@@ -943,7 +977,7 @@ mod tests {
     fn granted_bank_is_granted_access() {
         let issuer = "issuer-1".to_string();
         let bank = "bank-1".to_string();
-        let role = resolve_access(&bank, &issuer, &Some(bank.clone()), &[]).unwrap();
+        let role = resolve_access(&bank, &issuer, &Some(bank.clone()), false).unwrap();
         assert_eq!(role, AccessRole::Bank);
         assert_eq!(audit_action_for(&role), "key_derived_bank");
     }
@@ -953,7 +987,7 @@ mod tests {
         let issuer = "issuer-1".to_string();
         let granted_bank = "bank-1".to_string();
         let other_bank = "bank-2".to_string();
-        let result = resolve_access(&other_bank, &issuer, &Some(granted_bank), &[]);
+        let result = resolve_access(&other_bank, &issuer, &Some(granted_bank), false);
         assert_eq!(result, Err(AccessError::NotAuthorized));
     }
 
@@ -961,7 +995,7 @@ mod tests {
     fn stranger_is_denied() {
         let issuer = "issuer-1".to_string();
         let stranger = "stranger".to_string();
-        let result = resolve_access(&stranger, &issuer, &None, &[]);
+        let result = resolve_access(&stranger, &issuer, &None, false);
         assert_eq!(result, Err(AccessError::NotAuthorized));
     }
 
@@ -969,7 +1003,7 @@ mod tests {
     fn registered_regulator_is_granted_access_and_flagged_as_disclosure() {
         let issuer = "issuer-1".to_string();
         let regulator = "regulator-1".to_string();
-        let role = resolve_access(&regulator, &issuer, &None, &[regulator.clone()]).unwrap();
+        let role = resolve_access(&regulator, &issuer, &None, true).unwrap();
         assert_eq!(role, AccessRole::Regulator);
         assert_eq!(audit_action_for(&role), "disclosure_request");
     }
@@ -980,13 +1014,7 @@ mod tests {
         // be flagged as a disclosure event, not silently treated as routine
         // issuer access -- the log's purpose is to never under-report.
         let dual_role_principal = "dual-1".to_string();
-        let role = resolve_access(
-            &dual_role_principal,
-            &dual_role_principal,
-            &None,
-            &[dual_role_principal.clone()],
-        )
-        .unwrap();
+        let role = resolve_access(&dual_role_principal, &dual_role_principal, &None, true).unwrap();
         assert_eq!(role, AccessRole::Regulator);
     }
 
@@ -994,9 +1022,24 @@ mod tests {
     fn unregistered_caller_claiming_to_be_regulator_is_denied() {
         let issuer = "issuer-1".to_string();
         let fake_regulator = "not-actually-registered".to_string();
-        let real_regulators = vec!["regulator-1".to_string()];
-        let result = resolve_access(&fake_regulator, &issuer, &None, &real_regulators);
+        // fake_regulator is not in the registered set -- caller_is_regulator is false
+        // even though a *different* principal ("regulator-1") is registered.
+        let result = resolve_access(&fake_regulator, &issuer, &None, false);
         assert_eq!(result, Err(AccessError::NotAuthorized));
+    }
+
+    #[test]
+    fn caller_is_regulator_flag_takes_priority_over_issuer_and_bank_match() {
+        // Round 3 review, §4: resolve_access now takes a pre-resolved bool
+        // instead of scanning a regulator list itself. This test exists so
+        // that if a future caller ever accidentally passes the *wrong*
+        // caller's regulator status (a classic refactor bug when replacing
+        // a list-scan with a single lookup), a test fails loudly: the
+        // Regulator label must still win even when the same principal is
+        // also the issuer and/or the granted bank.
+        let dual = "dual-2".to_string();
+        let role = resolve_access(&dual, &dual, &Some(dual.clone()), true).unwrap();
+        assert_eq!(role, AccessRole::Regulator);
     }
 
     // ---- Rate limiting ----
@@ -1048,82 +1091,26 @@ mod tests {
         assert!(check_payload_size(1_001, 1_000).is_err());
     }
 
-    // ---- Cycles fee guard ----
+    // ---- Transport key length guard ----
 
     #[test]
-    fn cycles_fee_accepts_exact_and_generous_amounts() {
-        assert_eq!(
-            check_cycles_fee(MIN_DERIVE_KEY_FEE_CYCLES, MIN_DERIVE_KEY_FEE_CYCLES),
-            Ok(())
-        );
-        assert!(check_cycles_fee(u128::MAX, MIN_DERIVE_KEY_FEE_CYCLES).is_ok());
+    fn transport_key_within_bounds_is_accepted() {
+        assert_eq!(check_transport_key_length(48, 32, 128), Ok(()));
     }
 
     #[test]
-    fn cycles_fee_rejects_underpayment_including_off_by_one() {
-        assert!(check_cycles_fee(0, MIN_DERIVE_KEY_FEE_CYCLES).is_err());
-        assert!(check_cycles_fee(MIN_DERIVE_KEY_FEE_CYCLES - 1, MIN_DERIVE_KEY_FEE_CYCLES).is_err());
+    fn transport_key_below_minimum_is_rejected() {
+        assert!(check_transport_key_length(4, 32, 128).is_err());
     }
 
     #[test]
-    fn cycles_fee_error_message_reports_both_sides() {
-        let err = check_cycles_fee(5, 10).unwrap_err();
-        assert!(err.contains("at least 10 cycles"));
-        assert!(err.contains("got 5"));
-    }
-
-    // ---- Identifier validation ----
-
-    #[test]
-    fn identifier_accepts_common_formats() {
-        assert_eq!(validate_identifier("INV-2026_001.a:7", "f", 64), Ok(()));
-        assert_eq!(
-            validate_identifier(&"a".repeat(64), "f", 64),
-            Ok(())
-        );
-        assert_eq!(
-            validate_identifier(
-                &"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".to_string(),
-                "f",
-                128
-            ),
-            Ok(())
-        );
+    fn transport_key_above_maximum_is_rejected() {
+        assert!(check_transport_key_length(4096, 32, 128).is_err());
     }
 
     #[test]
-    fn identifier_rejects_empty_and_oversized() {
-        assert!(validate_identifier("", "f", 64).is_err());
-        assert!(validate_identifier(&"a".repeat(65), "f", 64).is_err());
-    }
-
-    #[test]
-    fn identifier_rejects_whitespace_control_and_shell_hostile_chars() {
-        for bad in ["has space", "tab\tchar", "new\nline", "semi;colon", "$expand", "`cmd`", "pipe|x"] {
-            assert!(validate_identifier(bad, "f", 64).is_err(), "should reject {bad:?}");
-        }
-    }
-
-    #[test]
-    fn register_invoice_enforces_identifier_format() {
-        let mut state = ProtocolState::new("admin".to_string());
-        let err = state
-            .register_invoice(
-                &"issuer-1".to_string(),
-                "bad id with spaces".to_string(),
-                "null-1".to_string(),
-                0,
-            )
-            .unwrap_err();
-        assert!(err.contains("invoice_id"));
-        let err = state
-            .register_invoice(
-                &"issuer-1".to_string(),
-                "inv-ok".to_string(),
-                String::new(),
-                0,
-            )
-            .unwrap_err();
-        assert!(err.contains("nullifier_hash"));
+    fn transport_key_at_exact_bounds_is_accepted() {
+        assert_eq!(check_transport_key_length(32, 32, 128), Ok(()));
+        assert_eq!(check_transport_key_length(128, 32, 128), Ok(()));
     }
 }

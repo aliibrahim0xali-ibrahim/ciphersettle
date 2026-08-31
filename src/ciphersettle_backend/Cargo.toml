@@ -8,7 +8,36 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 ciphersettle_core = { path = "../ciphersettle_core" }
-ic-cdk = "0.18"
-candid = "0.10"
+ic-cdk = "=0.18.5"
 serde = { version = "1", features = ["derive"] }
 ic-stable-structures = "0.6"
+
+# --- Sandbox-only pins, NOT a real production dependency policy ---
+# The sandbox this was checked in only has Ubuntu-packaged rustc 1.75
+# available (no network path to rustup). ic-cdk 0.17.x+ requires rustc
+# 1.78+, so this pins to ic-cdk 0.18.5 -- the newest non-yanked release
+# whose published rust_version is still 1.75.0 -- plus every transitive
+# dependency that would otherwise resolve to a newer, edition2024-requiring
+# version. Each pin below was found by actually trying to build against
+# this exact toolchain and walking the wall one crate at a time (see the
+# round-4 review/README note for the process), not guessed:
+#   - ic0, ic-cdk-executor, ic-management-canister-types: transitive deps
+#     of ic-cdk itself; each has a newer default resolution requiring
+#     rustc 1.78+/1.85+, pinned to their newest rust_version=1.75.0 release.
+#   - candid: ic-cdk 0.18.5 requires candid ^0.10.13; 0.10.15+ requires
+#     rustc 1.78+, so pinned to the newest 1.70.0-MSRV release that still
+#     satisfies that constraint (0.10.14).
+#   - ic_principal: candid's principal-encoding dependency; 0.1.2+ requires
+#     rustc 1.78+.
+#   - cc: pulled in by a build script; its own `ar_archive_writer`
+#     transitive dependency requires edition2024 (cargo 1.85+) at newer
+#     versions.
+# On a machine with a current rustup toolchain (1.85+), delete this whole
+# block, drop the `=0.18.5` pin on ic-cdk back to a normal `"0.18"` or
+# newer range, and let normal dependency resolution pick current versions.
+ic0 = "=1.0.0"
+ic-cdk-executor = "=1.0.1"
+ic-management-canister-types = "=0.3.2"
+candid = "=0.10.14"
+ic_principal = "=0.1.1"
+cc = "=1.0.90"

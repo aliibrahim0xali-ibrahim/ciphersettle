@@ -4,3 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# Round 3 review, §2: the hand-rolled SHA-256 that lived here was correct
+# (verified against the 4 NIST vectors plus 26 additional padding-boundary
+# vectors), but "don't roll your own crypto" is a process rule, not a
+# one-time correctness check -- a single-review implementation can't match
+# years of public scrutiny on a widely-deployed crate. Swapped to the
+# audited RustCrypto implementation; sha256.rs keeps the same public API
+# (`sha256`, `to_hex`) so nothing above this module had to change.
+sha2 = "0.10"
