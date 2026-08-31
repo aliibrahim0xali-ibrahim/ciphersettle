@@ -498,10 +498,32 @@ software itself (flat fee) rather than taking a cut of settled volume.
 - Pick a name and run a basic trademark/availability check yourself.
 - If you use ICP/DFINITY branding or trademarks anywhere, check DFINITY's
   brand guidelines.
-- Choose a license deliberately (this repo ships without a LICENSE file).
+- This project is licensed under the [MIT License](LICENSE).
 - **Decide and document your upgrade-governance model** (see "Still open,"
   item 6) before making any claim about "no standing master key" to anyone
   relying on it.
+
+## Contributing
+
+CipherSettle is open source and welcomes contributions. This is a
+proof-of-concept — none of it is audited or production-ready — and the README
+above records every review round and every deliberately-open design question.
+Please read it before contributing so your work fits the project's actual
+state.
+
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — architecture notes (change rules in
+  `ciphersettle_core` first), dev setup, testing expectations, and the
+  contribution workflow.
+- **[SECURITY.md](SECURITY.md)** — how to report a vulnerability privately
+  (do not file public issues for security bugs).
+- **[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)** — the standards all
+  contributors are expected to uphold.
+
+Bug reports and feature requests use the templates under `.github/`.
+
+## License
+
+[MIT](LICENSE)
 
 ## Running it locally
 
