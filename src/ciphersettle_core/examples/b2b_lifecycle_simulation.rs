@@ -1,4 +1,4 @@
-//! B2B lifecycle simulation for CipherSettle.
+//! B2B lifecycle simulation for VetKeys-Powered Invoice Settlement Canister.
 //!
 //! Runs entirely against `ciphersettle_core::ProtocolState` -- the same
 //! pure-logic "executable spec" the canister is built from (see the
@@ -42,12 +42,12 @@ fn fingerprint(issuer: &str, invoice_number: &str, currency: &str, amount: u64, 
 
 fn main() {
     println!("=====================================================");
-    println!(" CipherSettle -- B2B invoice-financing lifecycle demo");
+    println!(" VetKeys-Powered Invoice Settlement Canister -- B2B invoice-financing lifecycle demo");
     println!("=====================================================");
     println!(
         "Cast: Acme Manufacturing Ltd (issuer), Meridian Trade\n\
          Finance (bank), Northbridge Compliance Partners (regulator),\n\
-         and the CipherSettle platform operator (admin)."
+         and the canister's platform operator (admin)."
     );
 
     // Principals: in the real canister these are IC Principals; ProtocolState

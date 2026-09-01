@@ -1,6 +1,6 @@
 # Security Policy
 
-CipherSettle is a proof-of-concept for a confidential invoice/settlement
+The VetKeys-Powered Invoice Settlement Canister (formerly CipherSettle) is a proof-of-concept for a confidential invoice/settlement
 registry on the Internet Computer. It handles cryptographic keys, access
 control, and a public nullifier registry — the kind of code where a bug can
 have real confidentiality or integrity consequences.
@@ -43,7 +43,7 @@ Vulnerabilities in the canister code in this repository are in scope. The
 client-side hybrid-encryption construction (which the README explicitly leaves
 unbuilt and delegated to `@dfinity/vetkeys`) is generally out of scope here, as
 is the security of the Internet Computer platform itself. Nevertheless, if you
-find something relevant to how CipherSettle uses vetKD or deals with key
+find something relevant to how the canister uses vetKD or deals with key
 revocation, please report it — those are known-open design areas this project
 actively wants scrutiny on.
 

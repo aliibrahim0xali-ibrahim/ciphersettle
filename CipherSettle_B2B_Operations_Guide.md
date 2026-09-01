@@ -1,16 +1,16 @@
-# CipherSettle in a B2B Context: Utilization, Operation, and the Full Lifecycle
+# VetKeys-Powered Invoice Settlement Canister in a B2B Context: Utilization, Operation, and the Full Lifecycle
 
-This document has two parts. Part 1 describes how CipherSettle fits into a real B2B invoice-financing operation — the actors, the integration surface, the commercial model, and the operational responsibilities each party takes on. Part 2 walks through the two lifecycle scripts included in this repository, which together cover the full protocol lifecycle (setup, registration, verification, rejection, settlement, wind-down) and were both actually run and checked as part of writing this document, not just described.
+This document has two parts. Part 1 describes how this canister (formerly the VetKeys-Powered Invoice Settlement Canister) fits into a real B2B invoice-financing operation — the actors, the integration surface, the commercial model, and the operational responsibilities each party takes on. Part 2 walks through the two lifecycle scripts included in this repository, which together cover the full protocol lifecycle (setup, registration, verification, rejection, settlement, wind-down) and were both actually run and checked as part of writing this document, not just described.
 
 ---
 
-## Part 1 — CipherSettle in a B2B Context
+## Part 1 — The VetKeys-Powered Invoice Settlement Canister in a B2B Context
 
 ### 1.1 The business problem, restated for a B2B audience
 
 Invoice financing is a B2B transaction pattern: a supplier (the **issuer**) sells goods or services to a buyer on payment terms, then wants cash before those terms are up, so they pledge or sell the receivable to a bank, factor, or invoice-financing platform (the **bank/financier**). The recurring operational risk in this market is **double-financing** — the same invoice pledged to more than one financier, discovered only during reconciliation, a payment dispute, or a fraud investigation. Today this is largely handled by manual checks, bilateral trust, or centralized registries that force every participant to expose commercially sensitive data (who's financing whom, at what terms) to a platform operator or to each other.
 
-CipherSettle's B2B pitch is narrow and specific: **a shared, neutral registry that can answer "has this exact invoice already been claimed?" without any participant — including the registry operator — being able to read the invoice itself.**
+The canister's B2B pitch is narrow and specific: **a shared, neutral registry that can answer "has this exact invoice already been claimed?" without any participant — including the registry operator — being able to read the invoice itself.**
 
 ### 1.2 The four B2B roles, mapped to the protocol
 
@@ -19,13 +19,13 @@ CipherSettle's B2B pitch is narrow and specific: **a shared, neutral registry th
 | **Issuer** | The supplier / seller of goods or services — the company whose receivable is being financed. Typically integrates via their ERP or accounts-receivable system. |
 | **Bank / financier** | A bank, factoring company, or invoice-financing platform. Receives settlement access from the issuer, verifies the invoice is genuine and unclaimed, and (in the full system, once the client-side encryption spec exists — see §1.6) decrypts and reviews the invoice content before advancing funds. |
 | **Regulator** | A compliance function with standing disclosure rights — a tax authority, an AML/KYC auditor, or (for a private deployment) the platform operator's own compliance team. Every regulator access is logged distinctly as a `disclosure_request`, not conflated with ordinary bank access, which matters for audit and regulatory-defense purposes. |
-| **Admin** | The platform operator running the canister — typically the company offering CipherSettle as a service, or an internal platform team at a large financial institution running it for their own network of suppliers and financing partners. Manages regulator onboarding and admin-key rotation; deliberately has **no** path to read invoice ciphertext (see the round-3 review's §5 finding on this). |
+| **Admin** | The platform operator running the canister — typically the company offering this canister as a service, or an internal platform team at a large financial institution running it for their own network of suppliers and financing partners. Manages regulator onboarding and admin-key rotation; deliberately has **no** path to read invoice ciphertext (see the round-3 review's §5 finding on this). |
 
-A single B2B deployment can have many issuers and many banks operating against one canister — the protocol doesn't assume a 1:1 relationship. A large buyer could run a private CipherSettle instance for its entire supplier base and a panel of approved financing partners; a neutral platform operator could run a public instance serving many unrelated issuer/bank pairs, the way a traditional invoice-exchange platform does today, but without the operator itself being a trust bottleneck for confidentiality.
+A single B2B deployment can have many issuers and many banks operating against one canister — the protocol doesn't assume a 1:1 relationship. A large buyer could run a private instance of this canister for its entire supplier base and a panel of approved financing partners; a neutral platform operator could run a public instance serving many unrelated issuer/bank pairs, the way a traditional invoice-exchange platform does today, but without the operator itself being a trust bottleneck for confidentiality.
 
 ### 1.3 Integration surface for a B2B partner
 
-CipherSettle is delivered as an Internet Computer canister with a Candid interface (`ciphersettle_backend.did`) — this is the actual API surface a B2B integrator's engineering team builds against. Three practical integration patterns:
+This canister is delivered as an Internet Computer canister with a Candid interface (`ciphersettle_backend.did`) — this is the actual API surface a B2B integrator's engineering team builds against. Three practical integration patterns:
 
 - **Direct canister calls.** Any language with an IC agent library (`agent-js`/TypeScript, `agent-rs`/Rust, `ic-py`, etc.) can call the canister's 12 methods directly. This is the lowest-friction path for a fintech's own backend team.
 - **A thin REST/webhook wrapper.** Most B2B counterparties — an ERP system, a legacy banking core — don't speak Candid natively. A realistic integration shape is a small service (run by the platform operator, or by a sophisticated issuer/bank) that translates REST/webhook calls into IC canister calls, handles the vetKD transport-key dance client-side, and exposes a conventional API to the counterparty's existing systems.
@@ -35,7 +35,7 @@ Every method's `.did` signature is authoritative and, as of round 4 of this proj
 
 ### 1.4 What a B2B operator is actually responsible for
 
-Running CipherSettle for real counterparties is not "deploy the canister and you're done." A platform operator (the `admin` principal) takes on real, ongoing responsibilities:
+Running this canister for real counterparties is not "deploy the canister and you're done." A platform operator (the `admin` principal) takes on real, ongoing responsibilities:
 
 - **Regulator onboarding and offboarding** (`register_regulator`/`revoke_regulator`) — a real compliance decision with real consequences, not a technical afterthought. Every registered regulator gets standing disclosure access to every invoice on the platform.
 - **Admin-key custody and rotation policy** (`transfer_admin`) — who holds the admin key, how it's rotated, and what happens if it's lost or compromised is a governance decision this project deliberately does not make for you (see the README's "Still open" item 6 on upgrade governance).
@@ -46,14 +46,14 @@ Running CipherSettle for real counterparties is not "deploy the canister and you
 
 This matters commercially, not just technically: **overselling what's actually enforced today is a real business risk**, not just a documentation nicety. Based on five rounds of applied-cryptography review in this repository, here is the accurate, current claim set:
 
-**What CipherSettle actually enforces today:**
+**What this canister actually enforces today:**
 - Two honest, independent submissions of the same invoice (same issuer, invoice number, currency, amount, and due date) will always collide and the second is rejected — the core double-financing check works.
 - Small cosmetic differences (case, whitespace) between two submissions of the same invoice don't create a false "different invoice" — this was a real gap closed in round 2.
 - Invoice content is never visible to the canister or its operator in plaintext; only ciphertext and access-control metadata are ever stored.
 - Every disclosure of decryption capability is logged, distinctly, by role (issuer/bank/regulator).
 - An unauthenticated party cannot use the registration endpoint to learn whether a specific guessed invoice already exists — this was a real gap closed in round 3.
 
-**What CipherSettle does not yet enforce, and should not be represented as enforcing to a counterparty:**
+**What this canister does not yet enforce, and should not be represented as enforcing to a counterparty:**
 - **Front-running.** Because the nullifier is a deterministic hash of fields with no secret mixed in, a third party who can guess or observe an invoice's fields can register that nullifier first, blocking the legitimate issuer. Closing this needs either an external attestation authority (a tax registry or e-invoicing platform vouching for a specific issuer/invoice pairing) or, as a smaller interim step, pre-registering which principal is allowed to act as which issuer. **Neither is built yet.** Any B2B pitch should describe double-financing prevention as "prevents accidental or naive duplicate submission" today, not "cryptographically prevents fraud by a sophisticated adversary," until this is closed.
 - **The client-side encryption construction doesn't exist yet.** The canister correctly handles key derivation (vetKD) and access control; the actual encrypt/decrypt flow a client application would use is unspecified. This is the single largest piece of unbuilt work standing between this repository and a real product a bank could integrate against for actual invoice content review.
 - **Key revocation is authorization-only, not cryptographic.** Revoking a bank's settlement access stops them from deriving a *new* key; it does not invalidate a key they already derived. A bank that already reviewed an invoice retains that capability indefinitely. This is inherent to the current design, not a bug, but it must be stated plainly in any counterparty-facing terms.

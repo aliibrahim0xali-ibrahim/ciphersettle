@@ -1,4 +1,4 @@
-# Contributing to CipherSettle
+# Contributing to VetKeys-Powered Invoice Settlement Canister
 
 Thanks for your interest in contributing. This is a small personal open-source
 project, so clear, well-scoped contributions are especially appreciated.

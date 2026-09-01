@@ -1,4 +1,4 @@
-# CipherSettle
+# VetKeys-Powered Invoice Settlement Canister
 
 Confidential invoice-settlement protocol on the Internet Computer. A minimal
 Rust canister implementing encrypted invoice records with a public nullifier
@@ -31,7 +31,7 @@ Treat this as a skeleton for your own further development and review.
 
 ## How It Works
 
-CipherSettle solves one specific B2B problem: **preventing the same invoice
+**VetKeys-Powered Invoice Settlement Canister** (formerly CipherSettle) solves one specific B2B problem: **preventing the same invoice
 from being financed at more than one institution**, without any participant --
 including the platform operator -- being able to read the invoice itself.
 

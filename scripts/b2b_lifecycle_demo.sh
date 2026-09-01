@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# CipherSettle -- B2B lifecycle demo against a real deployed canister.
+# VetKeys-Powered Invoice Settlement Canister -- B2B lifecycle demo against a real deployed canister.
 #
 # Mirrors examples/b2b_lifecycle_simulation.rs (in ciphersettle_core) call
 # for call, but drives the actual `ciphersettle_backend` canister via `dfx`
