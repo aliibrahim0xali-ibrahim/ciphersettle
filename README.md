@@ -1,303 +1,352 @@
 # CipherSettle
 
-> **Confidential invoice &amp; settlement records on the Internet Computer.**
-> A public nullifier registry for double-financing prevention with
-> vetKeys-based encryption and event-driven selective disclosure.
+Confidential invoice-settlement protocol on the Internet Computer. A minimal
+Rust canister implementing encrypted invoice records with a public nullifier
+registry for double-financing prevention, vetKeys for encryption, and
+event-driven selective disclosure.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.75+-orange.svg)](#requirements)
-![Status: PoC](https://img.shields.io/badge/status-proof--of--concept-lightgrey)
+A jurisdiction-agnostic, personal open-source proof-of-concept -- no named
+market, no named regulator, no named KYC/e-invoicing provider. Compliance and
+identity integrations are left as pluggable extension points.
 
-> ⚠️ **Not audited. Not tested against a live replica. Not production-ready.**
-> This is a working proof of concept — a skeleton for your own development and
-> review. See [Security](#security) and [Open design questions](#open-design-questions).
+**Not audited. Not tested against a live replica. Not production-ready.**
+Treat this as a skeleton for your own further development and review.
 
 ---
 
-## Table of contents
+## Table of Contents
 
-- [Why](#why)
-- [Features](#features)
+- [How It Works](#how-it-works)
 - [Architecture](#architecture)
-- [Endpoint reference](#endpoint-reference)
-- [Getting started](#getting-started)
-  - [Requirements](#requirements)
-  - [Build &amp; test](#build--test)
-  - [Deploy to a local replica](#deploy-to-a-local-replica)
+- [API Reference](#api-reference)
+- [Getting Started](#getting-started)
+- [B2B Lifecycle Demo](#b2b-lifecycle-demo)
+- [What's Built and Tested](#whats-built-and-tested)
+- [Open Design Questions](#open-design-questions)
 - [Security](#security)
-- [Open design questions](#open-design-questions)
-- [Roadmap](#roadmap)
 - [Contributing](#contributing)
 - [License](#license)
 
 ---
 
-## Why
+## How It Works
 
-Invoice financing has a fundamental tension: the parties need to *prove* an
-invoice hasn't already been financed to a different lender, while keeping the
-invoice's business details (amount, due date, counterparty) confidential from
-everyone except those explicitly entitled to them.
+CipherSettle solves one specific B2B problem: **preventing the same invoice
+from being financed at more than one institution**, without any participant --
+including the platform operator -- being able to read the invoice itself.
 
-CipherSettle is a minimal reference implementation of that tension on the
-Internet Computer:
+The flow:
 
-- **Double-financing prevention without disclosure.** Registration commits a
-  deterministic *nullifier* — a hash of the invoice's identifying fields — to
-  a public registry. Two submissions declaring the same fields collide, so the
-  same invoice can't be financed twice, yet the raw fields themselves are never
-  stored: only the hash is public.
-- **Encryption by vetKeys, not the canister.** The canister never sees
-  plaintext. Clients encrypt client-side and upload ciphertext; decryption keys
-  are derived on-chain from the ICP [vetKD](https://internetcomputer.org/docs/building-apps/encryption)
-  system API, limited to authorized parties.
-- **Event-driven selective disclosure.** Every access event is appended to an
-  immutable, access-gated audit log — regulators can follow a `disclosure_request`
-  trail without ever seeing plaintext.
+1. **Issuer registers an invoice.** They encrypt invoice content
+   client-side (out of this repo's scope -- see [Open Design
+   Questions](#open-design-questions)) and submit the ciphertext alongside
+   five declared identifying fields (issuer ID, invoice number, currency,
+   amount, due date). The canister derives a deterministic 32-byte nullifier
+   from those fields via SHA-256 and rejects the registration if an invoice
+   with the same fields is already on file. The declared fields themselves
+   are never stored -- only their hash.
 
-The project is deliberately generic: no named market, regulator, or KYC/
-e-invoicing provider. Compliance and identity integrations are left as
-pluggable extension points so the core protocol isn't coupled to any one
-country's rules.
+2. **Issuer grants settlement access to a bank.** Only the original issuer
+   can name a counterparty (a financing institution) that may later derive
+   a decryption key.
 
----
+3. **Bank derives a decryption key via vetKD.** The bank fetches encrypted
+   ciphertext from the canister, derives a decryption key through the vetKD
+   threshold key derivation protocol, and decrypts client-side.
 
-## Features
+4. **Settlement happens off-canister.** Actual fund movement goes through
+   whatever licensed banking or payment rail the deploying party already
+   uses. The canister records the terminal state when either party marks the
+   invoice settled.
 
-| Area | Status |
-|---|---|
-| On-chain nullifier derivation from canonicalized invoice fields | ✅ |
-| Double-financing rejection (duplicate nullifier / duplicate `invoice_id`) | ✅ |
-| Role-based access: issuer, bank, regulator, admin | ✅ |
-| vetKD key derivation, gated per role | ✅ |
-| Access-gated, paginated append-only audit log | ✅ |
-| Ciphertext pruning after settlement + retention window | ✅ |
-| Admin rotation (`transfer_admin`) | ✅ |
-| Per-caller rate limiting on cycle-sensitive endpoints | ✅ |
-| Audited `sha2` (RustCrypto) for hashing | ✅ |
-| Mechanically-verified Candid interface (12 methods) | ✅ |
-| Client-side hybrid-encryption spec | ❌ out of scope (see [Open design questions](#open-design-questions)) |
+5. **Ciphertext is pruned after retention.** Once an invoice is settled and
+   past a ~180-day retention window, its ciphertext blob can be dropped to
+   free stable-memory. The audit trail is never pruned.
+
+6. **Regulators get standing disclosure access.** A registered regulator
+   may derive decryption keys for any invoice. Every such access is logged
+   distinctly as a `disclosure_request` event, not conflated with ordinary
+   counterparty access.
 
 ---
 
 ## Architecture
 
-A two-crate Rust workspace. The split is deliberate:
+The workspace has two crates with a deliberate split:
 
-```
-src/
-├── ciphersettle_core/        # Pure Rust "executable spec" — no IC deps
-│   └── src/
-│       ├── lib.rs            # ProtocolState: access, rate limit, lifecycle rules
-│       ├── nullifier.rs      # InvoiceFingerprint + canonicalized nullifier
-│       └── sha256.rs         # SHA-256 via audited sha2 crate
-└── ciphersettle_backend/     # The IC canister (ic-cdk, stable memory, vetKD)
-    ├── ciphersettle_backend.did   # Candid interface
-    └── src/lib.rs                 # Thin wiring over the core spec
-```
+### `ciphersettle_core` -- Executable Spec
 
-**Treat `ciphersettle_core` as the executable spec.** Every protocol rule
-(lifecycle state machine, access decisions, nullifier derivation, rate limits,
-payload-size checks, retention logic) lives and is unit-tested in
-`ciphersettle_core`. The canister crate is intentionally thin wiring that maps
-Candid arguments onto those tested rules. When you change a rule, change it in
-the core crate first, get it green, then port it to the backend. This keeps the
-security-critical logic testable without a full IC runtime and is the primary
-reason bugs are caught here rather than on mainnet.
+Pure Rust with **zero IC dependencies** (only `sha2` from RustCrypto). All
+protocol rules live here:
 
-`ciphersettle_backend` deliberately has almost no unit tests of its own — its
-responsibility is interface mapping, not policy.
+- Access-decision logic (`resolve_access`)
+- Nullifier derivation with canonicalization (`compute_nullifier`)
+- Double-financing check (`check_nullifier`)
+- Rate-limit enforcement (`check_rate_limit`)
+- Payload-size and transport-key validation
+- Full `ProtocolState` -- a complete in-memory simulation of the canister's
+  stable-structure logic, testable on any Rust toolchain
 
----
+**84 unit tests**, all passing. This is the project's primary test surface.
 
-## Endpoint reference
+Treat `ProtocolState` as the executable spec: change a rule here first, get it
+green, then port it to `ciphersettle_backend`.
 
-All methods are update calls (they go through consensus — appropriate for
-access-controlled or evidentiary reads on ICP, where a bare query could be
-served from an untrusted replica). Signatures are declared in
-[`ciphersettle_backend.did`](src/ciphersettle_backend/ciphersettle_backend.did).
+### `ciphersettle_backend` -- IC Canister
 
-### Registration &amp; lifecycle
+The wire layer using `ic-cdk`, `ic-stable-structures`, and vetKD. Thin
+wiring that calls into `ciphersettle_core` for all decision logic. Stores
+nullifiers, invoices, regulators, and audit events in stable memory via
+`StableBTreeMap` and `StableCell`.
 
-| Method | Access | Description |
-|---|---|---|
-| `register_invoice(invoice_id, issuer_identifier, invoice_number, currency_code, amount_minor_units, due_date_unix, ciphertext) -> {Ok: text; Err: text}` | anyone (rate-limited) | Encrypt client-side, submit ciphertext + declared identifying fields. **The canister derives the nullifier itself** from those fields and rejects a duplicate (the double-financing check) without ever seeing plaintext or persisting the raw fields. Returns the derived nullifier as a hex receipt. Rejections past field validation are deliberately indistinguishable (see [Security](#security)). |
-| `grant_settlement_access(invoice_id, counterparty)` | issuer | Name a counterparty (e.g. a financing institution). |
-| `revoke_settlement_access(invoice_id)` | issuer | Pull a granted counterparty's access. Errors if nothing was granted. *Authorization only — see [Open design questions](#open-design-questions).* |
-| `mark_settled(invoice_id)` | issuer or bank | Record settlement (fund movement is off-canister). Rejects double-settling; makes the invoice eligible for pruning. |
-| `prune_ciphertext(invoice_id)` | anyone (eligibility-gated) | Drop the ciphertext blob once Settled and past the retention window (~180 days). Invoice record + audit trail are **never** deleted. |
-
-### Confidential reads &amp; keys
-
-| Method | Access | Description |
-|---|---|---|
-| `get_encrypted_invoice(invoice_id) -> {Ok: blob; Err: text}` | issuer, bank, regulator | Return raw ciphertext. Deliberately **not** admin-accessible. Every read is logged as `ciphertext_accessed`. |
-| `derive_invoice_key(invoice_id, transport_public_key) -> {Ok: blob; Err: text}` | issuer, bank, regulator | Derive a vetKD decryption key into the caller's transport key. Regulator calls logged as `disclosure_request`. Rate-limited. |
-| `get_vetkd_public_key() -> blob` | anyone | The canister's vetKD public key, for use by the client-side encryption flow. |
-| `get_audit_log(invoice_id: opt text, offset: opt nat64, limit: opt nat64) -> {Ok: vec AuditEvent; Err: text}` | per-invoice: issuer/bank/regulator/admin; unscoped: admin-only | Immutable, access-gated metadata log. Never returns ciphertext/plaintext, never pruned. `limit` clamped to 500 server-side. |
-
-### Administration
-
-| Method | Access | Description |
-|---|---|---|
-| `register_regulator(principal)` / `revoke_regulator(principal)` | admin | Manage the regulator set. |
-| `transfer_admin(new_admin)` | admin | Rotate the admin principal, so a lost/compromised admin key isn't a permanent lockout. |
+One unit test: a Candid interface verification that cross-checks the
+compiler-generated service interface against the checked-in `.did` file.
 
 ---
 
-## Getting started
+## API Reference
 
-### Requirements
+12 canister methods, all defined in `ciphersettle_backend.did`:
 
-- **Rust toolchain.** `cargo test`/`build`/`clippy` on the workspace runs on
-  `rustc 1.75+` (see the pin block in
-  [`ciphersettle_backend/Cargo.toml`](src/ciphersettle_backend/Cargo.toml);
-  `Cargo.lock` is checked in for reproducibility).
-- **For an actual canister deployment:** the `wasm32-unknown-unknown` target,
-  [`dfx`](https://internetcomputer.org/docs/building-apps/getting-started/install),
-  and a local or mainnet replica.
+### Invoice Lifecycle
 
-### Build &amp; test
+| Method | Caller | Description |
+|--------|--------|-------------|
+| `register_invoice(invoice_id, issuer_identifier, invoice_number, currency_code, amount_minor_units, due_date_unix, ciphertext)` | Anyone | Register an invoice. The canister derives the nullifier from the declared fields. Returns the nullifier as a hex receipt. Rate-limited (20 calls/60s). Rejections past field validation are deliberately generic to prevent oracle attacks. |
+| `grant_settlement_access(invoice_id, bank)` | Issuer only | Grant a bank/financier decryption access to an invoice. |
+| `revoke_settlement_access(invoice_id)` | Issuer only | Revoke a previously granted bank's access. Errors if nothing was granted. |
+| `mark_settled(invoice_id)` | Issuer or granted bank | Record an invoice as settled. Fund movement happens off-canister. |
+| `prune_ciphertext(invoice_id)` | Anyone | Drop ciphertext for a settled invoice past the retention window (~180 days). Audit trail is never pruned. |
 
-Most work — type-checking, the full protocol test suite, linting — needs only a
-Rust toolchain:
+### Key Derivation and Retrieval
+
+| Method | Caller | Description |
+|--------|--------|-------------|
+| `derive_invoice_key(invoice_id, transport_public_key)` | Issuer, granted bank, or registered regulator | Derive a vetKD decryption key. Rate-limited (5 calls/60s). Regulator access is logged as `disclosure_request`. |
+| `get_encrypted_invoice(invoice_id)` | Issuer, granted bank, or registered regulator | Fetch the encrypted invoice blob. Update call (not query) for consensus safety. Logged as `ciphertext_accessed`. |
+| `get_vetkd_public_key()` | Anyone | Fetch the canister's vetKD public key (cacheable). |
+
+### Admin
+
+| Method | Caller | Description |
+|--------|--------|-------------|
+| `register_regulator(principal)` | Admin only | Register a principal with standing disclosure access to all invoices. |
+| `revoke_regulator(principal)` | Admin only | Revoke a regulator's disclosure access. |
+| `transfer_admin(new_admin)` | Admin only | Rotate the admin identity. Logged. |
+
+### Audit
+
+| Method | Caller | Description |
+|--------|--------|-------------|
+| `get_audit_log(invoice_id?, offset?, limit?)` | Gated | Paginated audit log. Per-invoice: issuer, granted bank, regulator, or admin. Unscoped: admin only. Metadata only (no ciphertext/plaintext). Limit clamped to 500. |
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+- Rust toolchain (1.75+ for build/test; 1.85+ recommended)
+- `dfx` and `wasm32-unknown-unknown` target for canister deployment
+
+### Build and Test (no dfx required)
 
 ```bash
-cargo test -p ciphersettle_core   # 85 tests: the executable protocol spec
-cargo build --workspace           # also compiles the canister crate
-cargo clippy --workspace          # zero warnings at the default lint level
+# Run all 84 core tests
+cargo test -p ciphersettle_core
+
+# Build the full workspace (including the backend canister crate)
+cargo build --workspace
+
+# Lint
+cargo clippy --workspace
 ```
 
-### Deploy to a local replica
+### Deploy to Local Replica
 
 ```bash
 rustup target add wasm32-unknown-unknown
 dfx start --background
 dfx deploy
+```
 
+### Example Canister Calls
+
+```bash
 dfx canister call ciphersettle_backend register_invoice \
   '("inv-001", "issuer-tax-id-123", "INV-001", "USD", 10000, 1893456000, blob "\00\01\02")'
+
 dfx canister call ciphersettle_backend grant_settlement_access \
   '("inv-001", principal "aaaaa-aa")'
+
+dfx canister call ciphersettle_backend derive_invoice_key \
+  '("inv-001", blob "\00\01\02\03")'
+
 dfx canister call ciphersettle_backend mark_settled '("inv-001")'
+
 dfx canister call ciphersettle_backend get_audit_log '(opt "inv-001", null, null)'
 ```
 
-> Note: the production vetKD key is **not** configured. `vetkd_key_id()` uses
-> `"dfx_test_key"`, which only exists on a local replica. Mainnet requires
-> requesting a real key name for your subnet.
+---
+
+## B2B Lifecycle Demo
+
+For a narrated, end-to-end walkthrough of a realistic B2B scenario, see
+[`CipherSettle_B2B_Operations_Guide.md`](CipherSettle_B2B_Operations_Guide.md).
+
+Two scripts cover the same scenario at different levels:
+
+### Rust Simulation (verified, runs today)
+
+```bash
+cargo run --example b2b_lifecycle_simulation -p ciphersettle_core
+```
+
+Runs against `ProtocolState` -- the same executable spec the canister is
+built from. Every step's outcome is asserted, not just printed. Covers:
+
+1. Platform setup (admin onboards a regulator)
+2. Invoice registration
+3. Double-financing rejection
+4. Oracle-closing check (indistinguishable error messages)
+5. Settlement-access grant
+6. Bank key derivation (+ unauthorized rejection)
+7. Regulator disclosure (distinctly logged)
+8. Access revocation and re-grant to a new bank
+9. Settlement (+ double-settlement rejection)
+10. Audit trail (scoped and unscoped, with access control)
+11. Ciphertext-pruning eligibility over time
+
+### Shell Script (deployment-level, reference only)
+
+```bash
+dfx start --background
+dfx deploy
+export ACME_PRINCIPAL=... MERIDIAN_PRINCIPAL=...
+./scripts/b2b_lifecycle_demo.sh
+```
+
+Same scenario as real `dfx canister call` invocations against a deployed
+canister. Requires `dfx` identities set up per organization. Not executable
+without a local replica.
+
+---
+
+## What's Built and Tested
+
+- **`ciphersettle_core`**: 84 unit tests, all passing. Covers access
+  decisions, nullifier derivation with canonicalization, double-financing
+  checks, rate limiting, payload-size guards, transport-key validation,
+  full protocol lifecycle, settlement, pruning eligibility, and audit-log
+  access control.
+
+- **`ciphersettle_backend`**: Compiled and tested against `ic-cdk 0.18.5`
+  on rustc 1.75. Candid interface mechanically verified against the `.did`
+  file. Zero clippy warnings at default lint level.
+
+- **Review rounds**: Five rounds of applied-cryptography review have been
+  conducted, covering nullifier binding, canonicalization, oracle
+  resistance, vetKD integration, stable-memory handling, and Candid
+  interface correctness. See [Review History](#review-history) below.
+
+### Review History
+
+| Round | Key Findings | Status |
+|-------|-------------|--------|
+| **1** | Nullifier had no cryptographic binding; audit log was public; confidential reads via uncertified queries; no admin rotation; unvalidated transport key; unbounded payloads | All fixed |
+| **2** | Nullifier fields hashed without canonicalization (case/whitespace bypass); `get_encrypted_invoice` privilege creep and missing audit trail | Fixed. Front-running and field-selection questions flagged as open design decisions |
+| **3** | `register_invoice` was an unauthenticated oracle; no rate limit on registration; vetKD keys not invalidated by revocation (structural); hand-rolled SHA-256 replaced with audited `sha2`; regulator set materialized on every call; unbounded audit-log response | Fixes applied; revocation semantics documented, not fixed (requires generation counter + re-encryption) |
+| **4** | `u64`->`usize` truncation on wasm32 target; redundant 64 KB ciphertext clone; Candid interface never mechanically checked | All fixed. Candid interface now auto-verified via `candid::export_service!()` |
+| **5** | `ProtocolState` spec had drifted from canister behavior on the round-3 oracle fix (collapsing error messages) | Fixed. Spec now matches deployed behavior; regression tests added |
+
+---
+
+## Open Design Questions
+
+These require design decisions, not just more code:
+
+1. **Front-running.** The nullifier is a deterministic hash of
+   guessable fields with no secret mixed in. Someone who guesses or observes
+   an invoice's fields can register the nullifier first. Closing this needs
+   either external attestation (a tax registry or e-invoicing platform
+   vouching for issuer/invoice pairings) or issuer-principal
+   pre-registration as a smaller interim step. Neither is built yet.
+
+2. **Client-side encryption construction.** The canister correctly handles
+   key derivation and access control. The actual hybrid-encryption
+   construction (which AEAD, how the vetKD-derived key feeds into it, how
+   associated data binds ciphertext to `invoice_id`) is unspecified and
+   unbuilt. This is the single largest piece of work between this repo and
+   a real product.
+
+3. **Key revocation is authorization-only, not cryptographic.**
+   `revoke_settlement_access` stops a party from deriving a *new* key; it
+   does not invalidate a key they already derived. A bank whose access was
+   pulled yesterday can still decrypt any ciphertext it fetched before
+   revocation, indefinitely. True revocation requires a generation counter
+   in the vetKD `input` plus client-side re-encryption -- real, unbuilt
+   work.
+
+4. **Which fields belong in the nullifier hash.** The current hash includes
+   amount and due date alongside issuer + invoice number. Narrowing to
+   issuer + invoice number only would require an explicit `amend_invoice`
+   flow for legitimate changes. This is a product decision that changes what
+   "double-financing prevention" means.
+
+5. **Upgrade governance.** `transfer_admin` prevents permanent lockout, but
+   "who is allowed to push a wasm upgrade" is IC controller-list
+   configuration outside this repo, and should be decided (multisig vs.
+   DAO-governed, with or without time lock) before any deployment claiming
+   "no standing master key."
+
+6. **Stable-memory migration.** `Decode!(...).expect()` still panics on
+   corrupted stable memory. A clean fix needs a schema-version byte plus
+   an explicit `post_upgrade` migration path, or upstream support for
+   fallible decoding.
 
 ---
 
 ## Security
 
-This project's history is documented as a series of applied-cryptography review
-rounds (kept for transparency in the previous README's changelog and the commit
-history). Notable properties and current posture:
+See [SECURITY.md](SECURITY.md) for vulnerability reporting guidelines.
 
-- **No raw invoice fields are persisted** — only the nullifier (a hash of
-  canonicalized, length-prefixed identifying fields with a domain separator).
-- **Canonicalized nullifiers** — currency is case-folded and shape-validated,
-  fields are trimmed, non-ASCII is rejected — so `"USD"` vs `"usd"` or
-  `" INV-001 "` vs `"INV-001"` can't be used to dodge the double-financing check.
-- **`register_invoice` is no longer a membership oracle.** Rejections past field
-  validation (duplicate nullifier vs. duplicate `invoice_id`) return identical
-  generic text; the specific reason is recorded in the admin audit log only.
-- **Confidential reads are update calls**, gated per role, and every read is
-  logged.
-- **Limited privilege creep** — `get_encrypted_invoice` is not admin-readable.
-- **Hashing via the audited `sha2` crate**, not a hand-rolled implementation.
+**Known security-relevant limitations:**
 
-### Reporting a vulnerability
-
-Do **not** open a public issue for security bugs. Report privately via the
-repository's **Security** tab, following [SECURITY.md](SECURITY.md). Please read
-it — especially the scope section — before you trust any of this with real data.
-
----
-
-## Open design questions
-
-These are decisions that need a design choice, not just more code. They are
-documented here so contributors and deploying parties know exactly where the
-rigor currently ends.
-
-1. **The nullifier trusts the caller's declared fields.**
-   - **Front-running / squatting.** Anyone who can observe or guess the fields
-     can compute the identical nullifier and register it first, blocking the
-     real issuer. The real fix is *external attestation* (an authoritative
-     registry signing off that a specific issuer may register a specific
-     invoice number); a smaller interim step is requiring the registering
-     caller to be pre-registered as the issuer for the declared
-     `issuer_identifier`.
-   - **Field choice is a product decision.** The identity hash currently
-     includes amount and due date alongside issuer + invoice number. A narrower
-     key (issuer + invoice number only) plus an explicit `amend_invoice`
-     operation is a defensible alternative.
-2. **Client-side encryption is unspecified.** The canister defers to
-   `@dfinity/vetkeys` (correctly — it never sees plaintext), but the concrete
-   hybrid-encryption construction (AEAD choice, how the vetKD-derived key feeds
-   in, how associated data binds ciphertext to `invoice_id`) lives in an
-   unwritten frontend. Pin this down as a spec before treating the API as
-   SDK-ready.
-3. **Key revocation is authorization-only, not cryptographic.**
-   `revoke_settlement_access` stops a party deriving a key *again*; it cannot
-   invalidate a key already derived and decrypted client-side. True
-   point-in-time revocation requires a generation counter mixed into the vetKD
-   input plus client-side re-encryption — real work, scoped as its own feature.
-4. **Rate limiting is per-principal, not per-identity-cost.** Cheaply-created
-   principals can still spread calls across identities. Closing this needs
-   cycles-attached calls or a real identity/subscription gate.
-5. **Stable-memory decode panics on corruption.** `Decode!(...).expect(...)`
-   panics on corrupted stable memory; a clean fix needs a schema-version byte
-   plus a `post_upgrade` migration path.
-6. **Upgrade governance is a deployment decision.** `transfer_admin` exists, but
-   who may push a wasm upgrade is IC controller-list configuration outside this
-   repo. Decide and document it (black-holed canister, multisig, DAO, time lock)
-   before claiming "no standing master key."
-
----
-
-## Roadmap
-
-High-priority, in rough order of value:
-
-1. **External attestation** for nullifier registration — closes the
-   front-running/squatting question (open item 1a).
-2. **Encryption-construction spec** for the client — pin the hybrid-encryption
-   scheme so the API becomes SDK-ready (open item 2).
-3. **Real vetKD mainnet key** provisioning and a live-replica test pass.
-4. **Generation-counter key rotation** for cryptographic revocation (open
-   item 3).
-
-Lower priority, explicitly out-of-scope-by-design today:
-- KYC/AML and identity-provider integrations
-- A dispute/challenge mechanism
-- SaaS billing / paywall enforcement
-- Any external system-of-record outcall
-
-> **Design constraint — "don't touch the money."** If you extend this toward
-> real settlement, keep fund custody and movement *entirely outside* the
-> canister: route it through a licensed banking/payment rail the deploying party
-> already uses, and charge a flat software fee rather than taking a cut of
-> settled volume.
+- Rate limiting is per-principal, not per-identity-cost. An attacker
+  spreading calls across many cheaply-created principals bypasses the
+  practical effect of rate limits.
+- `register_invoice` trusts the caller-supplied `invoice_id` itself (the
+  fingerprint fields are hashed, but `invoice_id` is not). Tie it to an
+  authoritative system once you add one.
+- `MIN_TRANSPORT_KEY_BYTES` / `MAX_TRANSPORT_KEY_BYTES` are loose bounds.
+  Confirm the exact expected byte length against your pinned vetkeys
+  library version before mainnet.
+- `vetkd_key_id()` uses `"dfx_test_key"`, which only exists on the local
+  replica. Mainnet requires a real key name.
+- The dependency pin block in `ciphersettle_backend/Cargo.toml` is a
+  sandbox workaround for rustc 1.75, not a production dependency policy.
+  On a current toolchain (1.85+), remove it and let normal resolution pick
+  current versions.
 
 ---
 
 ## Contributing
 
-Contributions are welcome — and because this is security-relevant code, please
-read the docs first so your work fits the project's actual state.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for architecture guidance, development
+setup, testing requirements, and PR workflow.
 
-- **[CONTRIBUTING.md](CONTRIBUTING.md)** — architecture ("change rules in
-  `ciphersettle_core` first"), dev setup, testing expectations, workflow.
-- **[SECURITY.md](SECURITY.md)** — private vulnerability reporting.
-- **[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)** — community standards.
-
-Bug reports and feature requests use the templates under `.github/`.
+Key principle: **change `ciphersettle_core` first**, get tests green, then
+port to `ciphersettle_backend`. Don't implement rules only in the canister.
 
 ---
 
 ## License
 
-[MIT](LICENSE) © 2026 [aliibrahim0xali-ibrahim](https://github.com/aliibrahim0xali-ibrahim).
+MIT -- see [LICENSE](LICENSE).
+
+---
+
+*A "don't touch the money" project: keep fund custody and movement entirely
+outside the canister, route through whatever licensed banking rail the
+deploying party already uses, and charge for the software itself rather than
+taking a cut of settled volume.*
